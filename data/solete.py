@@ -36,6 +36,8 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+from data.base import Dataset
+
 ZIP_URL = "https://ndownloader.figshare.com/files/69897429"  # SOLETEdataset.zip, v4
 RAW_DIR = Path(__file__).resolve().parent / "raw"
 
@@ -174,7 +176,8 @@ def read_columns(path, columns, key="DATA", chunk_rows=1 << 20):
 
     with tables.open_file(path) as f:
         node = f.get_node(f"/{key}")
-        if node._v_attrs.pandas_type != "frame" or node.axis1._v_attrs.kind != "datetime64[ns]":
+        kind = node.axis1._v_attrs.kind  # datetime64[ns] in the release, [us] from pandas >= 3
+        if node._v_attrs.pandas_type != "frame" or not kind.startswith("datetime64"):
             raise ValueError(f"{path}: expected a fixed-format frame with a datetime index")
         index = node.axis1.read()
         n = len(index)
@@ -191,7 +194,7 @@ def read_columns(path, columns, key="DATA", chunk_rows=1 << 20):
                 for c, j in wanted:
                     cols[c][start:start + len(chunk)] = chunk[:, j]
             out.update(cols)
-    return pd.DataFrame({c: out[c] for c in columns if c in out}, index=pd.DatetimeIndex(index.view("M8[ns]")))
+    return pd.DataFrame({c: out[c] for c in columns if c in out}, index=pd.DatetimeIndex(index.view(kind)))
 
 
 def load_solete(resolution="1min", path=None):
@@ -204,3 +207,19 @@ def load_solete(resolution="1min", path=None):
     columns = FEATURES + [f"{c}{s}" for c in FEATURES for s in QC_SUFFIXES]
     df = read_columns(path, columns).sort_index()
     return clean(df)
+
+
+class SoleteDataset(Dataset):
+    """SOLETE v4 at ``resolution``, cleaned by ``load_solete``, in physical units.
+
+    ``path`` reads an already downloaded v4 ``.h5`` file instead of fetching.
+    ``interpolated`` maps each column to the number of QC-interpolated values.
+    """
+
+    def __init__(self, resolution="1min", path=None):
+        self.resolution, self.path = resolution, path
+        super().__init__()
+
+    def _load(self):
+        df, self.interpolated = load_solete(self.resolution, self.path)
+        return df
