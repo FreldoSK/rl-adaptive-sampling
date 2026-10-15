@@ -52,6 +52,13 @@ class HankelPCABaselineTest(unittest.TestCase):
         self.assertAlmostEqual(r["worst_mse"], top.mean())
         self.assertGreaterEqual(r["worst_rmse"], r["rmse"])
 
+    def test_chunked_evaluate_matches_single_pass(self):
+        L = 3
+        whole = HankelPCABaseline(L, K=2, chunk_size=10_000).fit(self.X).evaluate(self.X)
+        chunked = HankelPCABaseline(L, K=2, chunk_size=20).fit(self.X).evaluate(self.X)
+        for key in whole:
+            self.assertAlmostEqual(chunked[key], whole[key], places=12)
+
     def test_grid_search_skips_infeasible_K(self):
         res = grid_search(self.X, L_values=[1, 2], K_values=[1, 4, 8])
         self.assertEqual([(r["L"], r["K"]) for r in res], [(1, 1), (1, 4), (2, 1), (2, 4), (2, 8)])

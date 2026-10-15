@@ -8,15 +8,22 @@ downloading all of it, the ZIP is read over HTTP range requests and only the
 requested ``.h5`` member is extracted into ``data/raw/`` (not tracked by git),
 then checked against the SHA256 published in the release's SHA256SUMS.txt.
 
-Cleaning follows the author's own QC flags (``<column>_qc_worst``, codes in
-``solete/qc_codes.py`` of https://github.com/DVPombo/SOLETE):
+Cleaning follows the author's own QC flags, codes in ``solete/qc_codes.py``
+of https://github.com/DVPombo/SOLETE. The 1-second file has one flag per
+value (``<column>_qc``); resampled files keep the most severe flag of each
+bucket (``<column>_qc_worst``), and ``_qc`` only where no such column exists.
 
-* ``Pressure[mbar]`` is dropped: code 2 (placeholder -> NaN) on 99.9% of rows.
-* ``P_Gaia[kW]`` is dropped: code 7 (provenance unverified) on every row and
-  almost always 0, so two active days would dominate the error tail.
+Only the environmental measurements of the weather station are used
+(``FEATURES``). Left out are plant outputs (``P_Solar``, ``P_Gaia``, ...),
+the plane-of-array irradiance ``POA Irr`` (tied to the PV installation),
+the computed sun position (``Azimuth``, ``Elevation``) and
+``Pressure[mbar]``, which is a placeholder (code 2 -> NaN) on 99.9% of rows.
+
 * Values flagged 4 (long dropout, zero kept as recorded) or 9 (out of bound,
   set to NaN) are replaced by linear interpolation in time, so the series
   stays on a regular grid (Hankel rows assume consecutive steps).
+* Other flags are kept as recorded: 1 (wind direction wrapped), 3 and 5
+  (short dropout / glitch already interpolated by the author).
 """
 
 import hashlib
@@ -26,6 +33,7 @@ import urllib.request
 import zipfile
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 ZIP_URL = "https://ndownloader.figshare.com/files/69897429"  # SOLETEdataset.zip, v4
@@ -40,12 +48,13 @@ SHA256 = {
 }
 
 FEATURES = [
-    "TEMPERATURE[degC]", "HUMIDITY[%]", "WIND_SPEED[m1s]", "WIND_DIR[deg]",
-    "GHI[kW1m2]", "POA Irr[kW1m2]", "P_Solar[kW]", "Azimuth[deg]", "Elevation[deg]",
+    "TEMPERATURE[degC]", "HUMIDITY[%]", "WIND_SPEED[m1s]", "WIND_DIR[deg]", "GHI[kW1m2]",
 ]
 
 # QC codes whose value is missing or not a real measurement.
 QC_INTERPOLATE = (4, 9)
+# Flag column suffixes in order of preference (resampled files, 1-second file).
+QC_SUFFIXES = ("_qc_worst", "_qc")
 
 
 class _HTTPRangeFile(io.RawIOBase):
@@ -133,15 +142,56 @@ def clean(df):
     out = df[FEATURES].copy()
     counts = {}
     for col in FEATURES:
-        flag_col = f"{col}_qc_worst"
         bad = out[col].isna()
-        if flag_col in df:
-            bad |= df[flag_col].isin(QC_INTERPOLATE)
+        for flag_col in QC_SUFFIXES:
+            if f"{col}{flag_col}" in df:
+                bad |= df[f"{col}{flag_col}"].isin(QC_INTERPOLATE)
+                break
         if bad.any():
             out[col] = out[col].mask(bad)
             counts[col] = int(bad.sum())
     out = out.interpolate(method="time", limit_direction="both")
     return out, counts
+
+
+def read_columns(path, columns, key="DATA", chunk_rows=1 << 20):
+    """Read only ``columns`` of a pandas HDF frame, chunk by chunk.
+
+    ``pd.read_hdf`` loads every column, which for the 1-second file (~39M
+    rows x 36 columns) needs ~11 GB. The release mixes both pandas formats:
+    the 1-second file is a ``table`` (read with ``HDFStore.select`` in row
+    chunks), the others are ``fixed``, which store one 2-D
+    ``block<i>_values`` array per dtype that the wanted columns are copied
+    out of. Columns missing from the file are skipped.
+    """
+    import tables
+
+    with pd.HDFStore(path, "r") as store:
+        storer = store.get_storer(key)
+        if storer.is_table:
+            present = [c for c in columns if c in storer.non_index_axes[0][1]]
+            return pd.concat(store.select(key, columns=present, chunksize=chunk_rows))
+
+    with tables.open_file(path) as f:
+        node = f.get_node(f"/{key}")
+        if node._v_attrs.pandas_type != "frame" or node.axis1._v_attrs.kind != "datetime64[ns]":
+            raise ValueError(f"{path}: expected a fixed-format frame with a datetime index")
+        index = node.axis1.read()
+        n = len(index)
+        out = {}
+        for b in range(node._v_attrs.nblocks):
+            items = [c.decode() for c in getattr(node, f"block{b}_items").read()]
+            wanted = [(c, items.index(c)) for c in columns if c in items]
+            if not wanted:
+                continue
+            values = getattr(node, f"block{b}_values")
+            cols = {c: np.empty(n, dtype=values.dtype) for c, _ in wanted}
+            for start in range(0, n, chunk_rows):
+                chunk = values[start:start + chunk_rows]
+                for c, j in wanted:
+                    cols[c][start:start + len(chunk)] = chunk[:, j]
+            out.update(cols)
+    return pd.DataFrame({c: out[c] for c in columns if c in out}, index=pd.DatetimeIndex(index.view("M8[ns]")))
 
 
 def load_solete(resolution="1min", path=None):
@@ -151,5 +201,6 @@ def load_solete(resolution="1min", path=None):
     fetching ``resolution``.
     """
     path = fetch(resolution) if path is None else Path(path)
-    df = pd.read_hdf(path, key="DATA").sort_index()
+    columns = FEATURES + [f"{c}{s}" for c in FEATURES for s in QC_SUFFIXES]
+    df = read_columns(path, columns).sort_index()
     return clean(df)

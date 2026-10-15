@@ -145,8 +145,7 @@ class HankelPCABaseline:
         physical unit. Set it to True for errors in raw units.
         """
         K = self._resolve_K(K)
-        X_true, X_hat = self.transform_reconstruct(X, K, original_units)
-        sample_mse = np.mean((X_true - X_hat) ** 2, axis=1)  # e(n), shape (T,)
+        sample_mse = self._sample_mse(self._check_X(X), K, original_units)  # e(n), shape (T,)
 
         n_worst = max(1, int(np.ceil(worst_fraction * sample_mse.size)))
         # np.partition finds the top n_worst in O(T), no full sort needed.
@@ -170,6 +169,22 @@ class HankelPCABaseline:
         }
 
     # ----------------------------------------------------------- helpers
+
+    def _sample_mse(self, X, K, original_units):
+        """Per-step error ``e(n)``, computed over blocks of ``chunk_size`` steps.
+
+        Blocks are whole multiples of ``L``, so they split the series exactly
+        at transmission boundaries and the result equals a single pass.
+        """
+        T = (X.shape[0] // self.L) * self.L
+        if T == 0:
+            raise ValueError(f"need at least L={self.L} time steps")
+        step = max(1, self.chunk_size // self.L) * self.L
+        out = np.empty(T)
+        for start in range(0, T, step):
+            X_true, X_hat = self.transform_reconstruct(X[start:min(start + step, T)], K, original_units)
+            out[start:start + X_true.shape[0]] = np.mean((X_true - X_hat) ** 2, axis=1)
+        return out
 
     def _windows_to_rows(self, windows):
         """(rows, N, L) ascending-time windows -> (rows, N*L) Hankel rows.
